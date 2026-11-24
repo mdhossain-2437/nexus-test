@@ -1,5 +1,9 @@
 # NEXUS — Interactive 3D Universe
 
+## Live preview
+
+Deployed automatically to GitHub Pages on every push to `main`: **https://mdhossain-2437.github.io/nexus-test/**
+
 ## Preview (captured from a real headless-Chromium run against `npm run dev`)
 
 | Universe | Object Explorer (exploded) |
