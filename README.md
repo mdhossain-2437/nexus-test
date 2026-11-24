@@ -2,7 +2,13 @@
 
 ## Live preview
 
-Deployed automatically to GitHub Pages on every push to `main`: **https://mdhossain-2437.github.io/nexus-test/**
+The production build (`dist/`) is committed to this repo. One-time setup in the repo UI:
+**Settings → Pages → Build and deployment → Source: "Deploy from a branch" → Branch: `main` → Folder: `/dist` → Save.**
+Then open **https://mdhossain-2437.github.io/nexus-test/**
+
+Alternatively, once the GitHub account's billing lock is resolved, choose Source: **"GitHub Actions"** instead —
+`.github/workflows/pages.yml` then builds and deploys `dist/` automatically on every push to `main`
+(currently blocked by the account-level runner lock; see repo Actions tab).
 
 ## Preview (captured from a real headless-Chromium run against `npm run dev`)
 
