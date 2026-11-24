@@ -1,21 +1,16 @@
-import { StrictMode } from "react";
-import { createRoot } from "react-dom/client";
-import App from "./App";
-import { ErrorBoundary } from "./components/ui/ErrorBoundary";
-import { useNexus } from "./store";
-import "./styles/global.css";
+import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import { App } from './App';
+import { ErrorBoundary } from './ui/ErrorBoundary';
+import './styles/global.css';
 
-if (import.meta.env.DEV) {
-  (window as unknown as { __nexus: typeof useNexus }).__nexus = useNexus;
-}
+const container = document.getElementById('root');
+if (!container) throw new Error('Root container missing in document.');
 
-const rootEl = document.getElementById("root");
-if (!rootEl) throw new Error("Missing #root element");
-
-createRoot(rootEl).render(
+createRoot(container).render(
   <StrictMode>
     <ErrorBoundary>
       <App />
     </ErrorBoundary>
-  </StrictMode>
+  </StrictMode>,
 );

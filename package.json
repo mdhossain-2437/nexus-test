@@ -2,28 +2,30 @@
   "name": "nexus",
   "private": true,
   "version": "1.0.0",
+  "description": "NEXUS \u2014 an immersive interactive 3D digital universe. Procedural geometry, custom GLSL, simulated particles, and a WebGPU compute experiment.",
   "type": "module",
-  "description": "NEXUS — an immersive interactive 3D digital universe. Vite + React + TypeScript + Three.js + Zustand + Tailwind.",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc -b",
+    "smoke": "node qa/smoke.mjs"
   },
   "dependencies": {
-    "react": "^19.3.1",
-    "react-dom": "^19.3.1",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.3",
     "three": "^0.187.0",
-    "zustand": "^5.1.0"
+    "zustand": "^5.0.8"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.3.5",
-    "@types/react": "^19.3.0",
-    "@types/react-dom": "^19.3.0",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
     "@types/three": "^0.187.0",
-    "@vitejs/plugin-react": "^6.3.0",
-    "tailwindcss": "^4.3.5",
-    "typescript": "^7.0.2",
-    "vite": "^8.3.8"
+    "@vitejs/plugin-react": "^5.1.4",
+    "@webgpu/types": "^0.1.74",
+    "playwright": "^1.65.1",
+    "pngjs": "^7.0.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.0"
   }
 }

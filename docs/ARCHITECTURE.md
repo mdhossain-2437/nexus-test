@@ -2,126 +2,186 @@
 
 ## 1. High-level architecture
 
+NEXUS is one persistent WebGL scene. There are no routes and no separate "pages": the seven
+sections are overlay panels in front of a single canvas, which keeps the object alive and
+continuous as the user moves between labs.
+
 ```
-┌─────────────────────────────── React (UI layer) ───────────────────────────────┐
-│  App.tsx (shell, keyboard, lifecycle)                                          │
-│  Nav.tsx · panels.tsx (7 sections) · ui/controls.tsx · ErrorBoundary          │
-│  store.ts — zustand: view, explorer, material, particles, shader,             │
-│             settings, perf, webgpu                                             │
-└───────────────▲───────────────────────────────▲────────────────────────────────┘
-                │ subscribe (slice-aware)       │ setPerf / setWebGPU (measured)
-┌───────────────┴───────────────────────────────┴────────────────────────────────┐
-│  SceneManager (engine, plain three.js, owns the canvas)                        │
-│  ├─ WebGLRenderer (ACES tone mapping, PCFSoft shadows, sRGB output)            │
-│  ├─ Scene: environment (PMREM RoomEnvironment), lights, fog, stars, floor     │
-│  ├─ NexusObject — procedural 6-layer centerpiece                               │
-│  ├─ ParticleField — GPGPU particles (ping-pong float RTs + trail history)      │
-│  ├─ ShaderLab — custom ShaderMaterial surface                                  │
-│  ├─ EffectComposer: RenderPass → UnrealBloomPass → OutputPass (toggleable)     │
-│  └─ OrbitControls + raycasting (hover/click) + adaptive DPR + perf sampling    │
-└────────────────────────────────────────────────────────────────────────────────┘
+┌──────────────── React tree (UI only) ────────────────┐
+│ NavRail · PanelHost (7 panels) · Veil · HUD · Notices│
+└──────────────┬───────────────────────────────────────┘
+               │ subscribe / get (Zustand)
+┌──────────────▼──────────────── NEXUS render loop ────┐
+│ NexusEngine ── pointer ──► raycaster ──► interactions │
+│    ├── scene graph (nexusObject, particleField)      │
+│    ├── EffectComposer (render → bloom → output)       │
+│    ├── adaptive DPR controller (frame-time EMA)        │
+│    └── stats sampler (4 Hz) ──► perf store             │
+└───────────────────────────────────────────────────────┘
+               ▲ independent module
+┌──────────────┴────────────────────────────────────┐
+│ WebGPUComputeDemo (own canvas, WGSL compute+render) │
+└────────────────────────────────────────────────────┘
 ```
 
-**Why plain three.js instead of React Three Fiber:** the app needs direct ownership of the `WebGLRenderer`
-(context loss, renderer rebuilds for MSAA), GPGPU render targets, and the post-processing composer. R3F adds a
-reconciler between React and three's object graph; here the graph is small and imperative by design, so R3F would
-add overhead without architectural value. React still owns all DOM/UI, and the store is the only bridge between
-UI and engine — state changes are applied imperatively in `SceneManager`'s store subscription.
+Two Zustand stores split concerns deliberately:
 
-## 2. The centerpiece (NexusObject)
+- `state/store.ts` — *intent* (settings, parameters, layer visibility). Written by React,
+  read by both React and the engine.
+- `state/perf.ts` — *measurement* (sampled 4 Hz by the engine). Written only by the engine,
+  read only by the Monitor. Keeping it separate means telemetry updates re-render exactly
+  one component, never the render loop.
 
-Fully procedural — no imported assets:
+## 2. Why an imperative engine instead of React Three Fiber
 
-| Layer | Construction | Material / shader |
-| --- | --- | --- |
-| Plasma Core | `IcosahedronGeometry(0.92, 4)` displaced in the vertex shader by simplex noise + FBM | Custom `ShaderMaterial`: fresnel rim, noise banding, accent emissive, click pulse |
-| Glass Shell | `SphereGeometry(1.55, 96, 64)` | `MeshPhysicalMaterial`: transmission 0.92, IOR 1.45, clearcoat |
-| Gyro Rings | 3 × `TorusGeometry` in counter-rotating holders | Shared metallic `MeshPhysicalMaterial` (Material Studio target) |
-| Orbital Lattice | 900-point Fibonacci sphere + proximity edge struts (`LineSegments`) | `PointsMaterial` + low-opacity lines |
-| Satellites | `InstancedMesh` (42 spheres) on per-instance Kepler-style orbits, matrices recomputed per frame | Same metallic material |
-| Halo Field | 1,600 `Points` orbiting in the vertex shader (seed attributes) | Custom additive shader with twinkle |
+R3F is an excellent reconciler for declarative scene composition. NEXUS's needs are the
+opposite profile:
 
-Explorer "explode" moves each layer group along a fixed normalized axis scaled by a 0–1 parameter; visibility
-toggles map directly to layer groups; raycast hits resolve `userData.layerId` for hover/click selection.
+- One scene, one object graph whose lifetime is the session — nothing mounts/unmounts
+  with the UI tree.
+- A bespoke render loop with adaptive resolution, counted-frame instrumentation,
+  context-loss handling and visibility suspension — all imperative by nature.
+- A tenuous boundary is worse than an explicit one: the engine reads intent from the store
+  in a single `subscribe` handler and translates it into uniform/material/light updates.
 
-## 3. Rendering pipeline
+The React tree therefore owns *pixels of the interface*, and the engine owns *the frame*.
+No reconciler overhead, no hidden re-mounts, explicit `dispose()` for the entire resource graph.
 
-- **Renderer:** WebGL2, `ACESFilmicToneMapping` (exposure 1.12), sRGB output, PCFSoft shadow maps (single 2048²
-  key light, configurable per quality preset).
-- **Environment:** `PMREMGenerator.fromScene(RoomEnvironment)` gives image-based lighting/reflections for all PBR
-  materials without loading any HDR file.
-- **Post:** `RenderPass → UnrealBloomPass (threshold 0.78, strength from settings) → OutputPass`. Toggling
-  post-processing bypasses the composer entirely (direct `renderer.render`), which also applies tone mapping.
-- **MSAA:** antialiasing is a context-creation flag, so toggling it rebuilds the renderer on a fresh canvas and
-  re-creates GPU-side resources (composer, GPGPU targets, PMREM env) — materials/geometries recompile
-  automatically on the new context.
+## 3. State flow
 
-## 4. Particles (GPU simulation)
+`React (panels) → store → engine.subscribe → scene objects` and
+`engine (stats sampler) → perf store → Monitor component`.
 
-- Positions live in a 256×256 RGBA float texture (65,536 max). Each frame a fullscreen fragment shader reads the
-  previous texture, integrates a noise flow field + exponential mouse repulsion, respawns out-of-bounds particles
-  on a random shell, and writes into a ping-pong target.
-- **Trails:** three history targets are kept; three `Points` clouds render them with fading opacities
-  (1.0 / 0.38 / 0.16), additive blending. All on-GPU, no CPU readback.
-- Count changes use `geometry.setDrawRange` — no reallocation. Per-frame CPU work is zero (only uniform uploads).
-- Fallback: without `EXT_color_buffer_float`, targets use `HalfFloatType` (nearest filtering, still exact enough
-  for positions in this range).
+- Sliders in the Shader Lab write plain numbers into `shader` params; the engine maps each
+  key to the matching core uniform (`uDistortion`, `uNoiseScale`, `uFresnelPower`,
+  `uPaletteShift`, `uMouseInfluence`) — a 1:1 mapping, no intermediate layer to drift out
+  of sync.
+- Material Studio writes to the shared `MeshPhysicalMaterial` of the rings, including the
+  transparent/needsUpdate transitions required by `transmission` and `opacity < 1`.
+- Quality/post/shadow/motion flags are read inside the loop; a change of view preset arms a
+  cubic-eased camera tween that hands control back to OrbitControls on completion.
 
-## 5. Shader Lab
+## 4. The centrepiece
 
-One `ShaderMaterial` on a sphere, fragment shader implements four patterns selected by an int uniform:
+`scene/nexusObject.ts` constructs the object; there is no asset pipeline:
 
-1. **Aurora** — domain-warped FBM bands (`warp()` = two rounds of FBM displacement).
-2. **Voronoi** — animated F1/F2 cell-distance with edge highlighting.
-3. **Ripple** — mouse-centered interference rings distorted by noise.
-4. **Plasma** — classic multi-sine interference field.
+| Part | Construction |
+|---|---|
+| Core | `IcosahedronGeometry(1.35, 64)` — ~41k triangles, `ShaderMaterial` with a custom vertex/fragment pair (see below) |
+| Rings | 3 × `TorusGeometry(r, tube, 24, 220)` at mutual inclinations, one shared `MeshPhysicalMaterial` |
+| Lattice | `InstancedMesh(BoxGeometry, …, 1152)`; directions from a golden-angle Fibonacci sphere with deterministic `mulberry32` jitter, rods oriented radially via `lookAt`; two radii shells (3.05 / 3.75) |
+| Shadow | `PlaneGeometry(30,30)` + `ShadowMaterial(0.32)` at y = −4.4 |
 
-Shared uniforms: `uTime` (speed-scaled), `uMouse`, `uResolution`, `uFrequency`, `uDistortion`, `uHue` (Rodrigues
-hue rotation), `uIntensity`. All GLSL lives in `src/lib/shaders/glsl.ts`, written GLSL1-style; three.js transpiles
-to ES 3.00 on WebGL2.
+Determinism matters: the same `mulberry32` seeds reproduce the identical lattice and halo
+home positions on every load, on every machine.
 
-## 6. WebGPU experiment
+## 5. Shader Lab — what the GLSL actually does
 
-`src/lib/webgpu.ts` checks `navigator.gpu`, requests adapter + device, and runs a real compute workload
-(4,194,304-element wave computation) through a WGSL compute pipeline with a storage-buffer readback, verifying
-the checksum against a CPU reference. It reports GPU wall-time vs CPU wall-time and a capability string in the
-Monitor panel. If any step fails or is unsupported, the status says **unavailable** with the reason — the app
-never pretends WebGPU is active. The WebGL2 GPGPU particle system is the always-on GPU compute path.
+All sources live in `src/shaders/`. The core program implements, in order:
 
-## 7. Browser/GPU engineering
+1. **Procedural noise** — the Ashima/McEwan 3D simplex noise (public-domain reference
+   implementation), included once and composed into both program stages.
+2. **Vertex displacement** — two octaves travelling across the sphere plus a
+   `pow(dot(n, mouseDir), 12)` bulge that follows the projected pointer and sharpens on
+   hover; displaced positions feed a per-vertex energy term.
+3. **Fresnel** — `pow(1 − |N·V|, uFresnelPower)` drives the rim.
+4. **Domain distortion (the mathematical centerpiece)** — an Inigo Quilez double warp:
+   `q = fbm(p + …)`, `r = fbm(p + 1.7·q)`; both `r` and `|q|` index a cosine palette
+   (`a + b·cos(2π(c·t+d))`). Four fbm octaves of simplex noise per channel.
+5. **Mouse interaction / time uniforms** — `uMouse` (object-space pointer ray direction),
+   `uHover`, `uTime`, all live-editable.
+6. **Procedural color transitions** — the palette phase is a uniform (`uPaletteShift`),
+   so hues morph continuously without any texture.
 
-- **Capability detection** (`capabilities.ts`): WebGL2 presence, unmasked renderer/vendor, max texture size,
-  float precision, `EXT_color_buffer_float`, `navigator.gpu`.
-- **Context loss/restore:** `webglcontextlost` is intercepted (preventDefault) with a visible badge; on
-  `webglcontextrestored` all render targets, the composer, the PMREM environment and the particle field are
-  rebuilt.
-- **Lifecycle:** single `requestAnimationFrame` loop with clamped delta; `ResizeObserver` drives resize; clock delta
-  freezes when the tab is hidden (rAF stops) and when paused; full disposal on unmount (geometries, materials,
-  targets, controls, renderer, canvas).
-- **Memory:** no per-frame allocations in the loop (vectors reused), typed arrays preallocated, instancing for
-  satellites, frustum culling disabled only for the unbounded particle clouds.
+The halo (`particles.ts`) is an instanced-billboard program (see §7) and the trails are a
+head/tail fading two-vertex segment shader with a shared opacity uniform.
 
-## 8. Performance engineering
+## 6. Particle simulation
 
-- Quality presets: `low/medium/high/ultra` → pixel-ratio caps 1.0/1.5/2.0/2.5 and shadow sizes 1024/1024/2048/2048.
-- Adaptive governor: every ~2 s of samples, if EMA FPS < 47 the pixel ratio steps down (min 0.5×), if > 57 it
-  steps back up — measured, not assumed.
-- Performance mode pins a 0.6× pixel-ratio scale and disables the governor's upscale.
-- Perf monitor samples `renderer.info` every 500 ms (draw calls, triangles, points, geometries, textures) plus
-  measured FPS/frame time; unavailable data renders as "—".
+`scene/particleField.ts` allocates once for the maximum capacity (24,000); "count" is a
+prefix (`InstancedBufferGeometry.instanceCount`), so changing it never reallocates GPU
+memory. Per frame, a single `step()` updates typed arrays in place:
 
-## 9. Accessibility & responsive design
+```
+v += (home − p) · cohesion · dt          // spring to a spherical home shell
+v += (a − p) · k / (|a − p|² + 0.35) dt  // pointer attractor / repulsor
+v += swirl(p, t, seed) · turbulence · dt // divergence-limited crossed sine field
+v *= damping^dt; p += v · dt              // integrate, clamp hard shell radius
+```
 
-- All controls are native `<input type="range">`, `<input type="checkbox" role="switch">`, `<button>` with
-  `aria-label`/`aria-pressed`; visible `:focus-visible` outlines; keyboard shortcuts documented in the UI.
-- `prefers-reduced-motion` (media query + live listener) slows animation ×0.25 and disables auto-rotation.
-- Panels are viewport-bounded with internal scrolling; nav scrolls horizontally on narrow screens; the canvas is
-  touch-enabled (`touch-action: none`).
-- Loading overlay with `role="status"`, fatal-error overlay, and an error boundary around the whole tree.
+Trails are 3,000 velocity-stretched segments written on a stride so trail counts stay fixed
+for any particle count. The attractor is the pointer ray's intersection with a sphere
+around the object — falling back to the ray's closest point — so the halo reacts in 3D
+space, not screen space. Pointer-down flips the attractor to repulsion.
 
-## 10. State flow
+## 7. Why the halo is instanced quads, not gl_Points
 
-`store.ts` (zustand) is the single source of truth. `SceneManager` subscribes and applies slice changes
-imperatively (view → camera goals/visibility, settings → quality/DPR/bloom/renderer rebuild, material/particles/
-shader/explorer → object uniforms and visibility). The engine writes back only measured data (`setPerf`) and
-WebGPU results (`setWebGPU`). No React state duplicates engine state.
+During QA (Chromium headless + ANGLE/SwiftShader) the entire post-processing chain rendered
+as a uniform white frame. A systematic bisect across isolated harnesses — built exactly to
+chase this — isolated the trigger: **point sprites with per-vertex `gl_PointSize` and
+additive blending into an offscreen FBO corrupted the whole composer output in that
+environment** (constant small sizes were fine; attenuated/clamped sizes up to 48px were not).
+
+Engineering conclusions:
+
+- `ALIASED_POINT_SIZE_RANGE` is implementation-defined; huge attenuated point sizes
+  (hundreds of pixels near the camera) were never safe to emit unclamped.
+- Point sprites are absent from WebGPU entirely, so they have no future-proof value.
+- Instanced billboard quads have no size limits, keep the single-draw-call budget, allow
+  perspective-attenuated sizes in world units, and run identically on every driver.
+
+The halo is therefore one `InstancedBufferGeometry` — 4 shared corner vertices, per-instance
+position/seed/scale attributes, billboarded in view space with the same twinkle and palette
+as before. This is the **portable** answer, and the QA suite verifies the full bloom chain
+end-to-end.
+
+## 8. WebGPU experiment
+
+`webgpu/computeDemo.ts` is fully modular: the app works if this module never initializes.
+Its design mirrors the CPU sim (home shell spring, pointer inverse-square force,
+swirl field, damping, containment) so the two labs are comparable:
+
+- 65,536 particles — 1,024 workgroups × 64 threads — integrated in a WGSL compute pass.
+- Positions live in one storage buffer bound twice: writable for compute, read-only for
+  the render pass (separate bind groups with correct `visibility` masks).
+- Rendering uses instanced quads (4-vertex triangle strip × instance count) with the
+  pointer tracked on the demo canvas; GPU loss ends the demo gracefully and never affects
+  the WebGL scene.
+- The probe uses `navigator.gpu.requestAdapter()` and reports *why* if unavailable; the
+  CPU-visible "submit time" is measured honestly and labelled as such — true GPU timing
+  would require the `timestamp-query` feature.
+
+## 9. Performance & lifecycle engineering
+
+- **Adaptive resolution** — a 90/10 frame-time EMA; >22 ms sustained steps the scale down
+  (min 60%), <14 ms steps it up (max 100%), with 2–4 s cooldowns between adjustments;
+  superseded by fixed-ratio in performance mode. Quality caps DPR at 1/1.5/2.
+- **Real instrumentation** — `renderer.info.autoReset = false` + one manual `reset()` per
+  frame so draw calls and triangles count the shadow pass, the scene and the whole bloom
+  chain. The monitor never prints a number it did not measure; anything unavailable is
+  shown as `—` with its source annotated.
+- **Disposal** — `NexusEngine.dispose()` walks every resource: geometries, materials,
+  render targets (bloom + composer), the PMREM environment, the renderer, controls, and
+  all event listeners. Original review: no per-frame allocations anywhere in the loop
+  (shared `Vector3`/`Matrix4`/`Ray` scratch objects).
+- **Context loss** — `webglcontextlost` is `preventDefault()`ed and the loop stops;
+  restoration resumes it. The UI surfaces the state instead of pretending nothing happened.
+- **Visibility & motion** — `visibilitychange` suspends the RAF loop; `prefers-reduced-motion`
+  is honoured at boot and overridable in Settings; reduced-motion zeroes ambient motion while
+  keeping full interactivity.
+
+## 10. Design system
+
+Graphite editorial dark: near-black `#08090a` field, hairline `8%`-white borders, one acid
+accent (`#d8ff7a`) reserved for measured data and active states, IBM Plex Mono for data and
+Space Grotesk for display. No glassmorphism panels, no gradient wash, no glow — light comes
+from the 3D scene. Panels are 384px editorial columns that become bottom sheets under
+720px; the nav rail collapses to 64px with the same seven targets.
+
+## 11. QA methodology
+
+`qa/smoke.mjs` is not decorative: it asserts zero console errors across a scripted session,
+pixel-validates the *composited* screenshot (so a plausible-looking black frame fails),
+exercises every panel via keyboard, flips real state through the switches, and checks the
+monitor's measured cells are numeric. The most valuable test is the one that found the
+gl_Points pipeline corruption: renderability is checked at the pixels, not at the API.
